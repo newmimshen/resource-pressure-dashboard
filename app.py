@@ -1,15 +1,18 @@
+import csv
+import io
 import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psutil
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, send_file
 
 app = Flask(__name__)
 
 DB_PATH = Path(os.environ.get("METRICS_DB", "/tmp/metrics.sqlite3"))
+RETENTION_DAYS = max(1, int(os.environ.get("METRICS_RETENTION_DAYS", "1")))
 SAMPLE_LOCK = threading.Lock()
 PROCESS = psutil.Process()
 CPU_COUNT = psutil.cpu_count(logical=True) or 1
@@ -20,6 +23,7 @@ PROCESS.cpu_percent(interval=None)
 
 
 def connect_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DB_PATH, timeout=5)
     connection.row_factory = sqlite3.Row
     return connection
@@ -27,6 +31,11 @@ def connect_db():
 
 def init_db():
     with connect_db() as db:
+        # Incremental auto-vacuum returns freed pages to the filesystem as
+        # old samples are removed. A one-time VACUUM migrates existing DBs.
+        if db.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
+            db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            db.execute("VACUUM")
         db.execute("""
             CREATE TABLE IF NOT EXISTS samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,7 +55,9 @@ def collect_sample():
         app_cpu = PROCESS.cpu_percent(interval=None) / CPU_COUNT
         system_ram = psutil.virtual_memory().percent
         app_ram_mb = PROCESS.memory_info().rss / (1024 * 1024)
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        now = datetime.now(timezone.utc)
+        timestamp = now.isoformat(timespec="seconds")
+        cutoff = (now - timedelta(days=RETENTION_DAYS)).isoformat(timespec="seconds")
 
         with connect_db() as db:
             db.execute(
@@ -57,12 +68,26 @@ def collect_sample():
                 """,
                 (timestamp, system_cpu, app_cpu, system_ram, app_ram_mb),
             )
+            db.execute("DELETE FROM samples WHERE timestamp < ?", (cutoff,))
             db.execute("""
                 DELETE FROM samples
                 WHERE id NOT IN (
                     SELECT id FROM samples ORDER BY id DESC LIMIT 1500
                 )
             """)
+            db.execute("PRAGMA incremental_vacuum")
+
+
+def get_recent_samples(limit=60):
+    with connect_db() as db:
+        rows = db.execute("""
+            SELECT timestamp, system_cpu, app_cpu, system_ram, app_ram_mb
+            FROM (
+                SELECT * FROM samples ORDER BY id DESC LIMIT ?
+            )
+            ORDER BY id ASC
+        """, (limit,)).fetchall()
+    return [dict(row) for row in rows]
 
 
 @app.after_request
@@ -80,17 +105,24 @@ def index():
 @app.get("/api/metrics")
 def metrics():
     collect_sample()
+    return jsonify(get_recent_samples())
 
-    with connect_db() as db:
-        rows = db.execute("""
-            SELECT timestamp, system_cpu, app_cpu, system_ram, app_ram_mb
-            FROM (
-                SELECT * FROM samples ORDER BY id DESC LIMIT 60
-            )
-            ORDER BY id ASC
-        """).fetchall()
 
-    return jsonify([dict(row) for row in rows])
+@app.get("/api/metrics.csv")
+def metrics_csv():
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["timestamp", "system_cpu", "app_cpu", "system_ram", "app_ram_mb"])
+    for sample in get_recent_samples(limit=1500):
+        writer.writerow([
+            sample["timestamp"], sample["system_cpu"], sample["app_cpu"],
+            sample["system_ram"], sample["app_ram_mb"],
+        ])
+
+    content = io.BytesIO(output.getvalue().encode("utf-8"))
+    content.seek(0)
+    filename = f"metrics-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.csv"
+    return send_file(content, mimetype="text/csv", as_attachment=True, download_name=filename)
 
 
 PAGE = """
@@ -116,12 +148,14 @@ PAGE = """
               gap: 14px; }
     canvas { width: 100%; }
     #status { min-height: 1.5em; }
+    a { color: #8fc2ff; }
   </style>
 </head>
 <body>
 <main>
   <h1>Local Resource Monitor</h1>
   <div class="muted">Live system and app metrics · sampled every 2 seconds</div>
+  <p><a href="/api/metrics.csv">Download metrics as CSV</a></p>
 
   <section class="cards">
     <div class="card">System CPU<span class="value" id="systemCpu">—</span></div>
@@ -176,16 +210,11 @@ PAGE = """
       if (!samples.length) return;
 
       const latest = samples[samples.length - 1];
-      document.getElementById("systemCpu").textContent =
-        `${latest.system_cpu.toFixed(1)}%`;
-      document.getElementById("appCpu").textContent =
-        `${latest.app_cpu.toFixed(1)}%`;
-      document.getElementById("systemRam").textContent =
-        `${latest.system_ram.toFixed(1)}%`;
-      document.getElementById("appRam").textContent =
-        `${latest.app_ram_mb.toFixed(1)} MB`;
-      document.getElementById("status").textContent =
-        `Last sample: ${timeLabel(latest.timestamp)}`;
+      document.getElementById("systemCpu").textContent = `${latest.system_cpu.toFixed(1)}%`;
+      document.getElementById("appCpu").textContent = `${latest.app_cpu.toFixed(1)}%`;
+      document.getElementById("systemRam").textContent = `${latest.system_ram.toFixed(1)}%`;
+      document.getElementById("appRam").textContent = `${latest.app_ram_mb.toFixed(1)} MB`;
+      document.getElementById("status").textContent = `Last sample: ${timeLabel(latest.timestamp)}`;
 
       const times = samples.map(s => timeLabel(s.timestamp));
       cpuChart.data.labels = times;
@@ -198,8 +227,7 @@ PAGE = """
       ramChart.data.datasets[1].data = samples.map(s => s.app_ram_mb);
       ramChart.update();
     } catch (error) {
-      document.getElementById("status").textContent =
-        `Could not load metrics: ${error.message}`;
+      document.getElementById("status").textContent = `Could not load metrics: ${error.message}`;
     }
   }
 
@@ -211,13 +239,12 @@ PAGE = """
 """
 
 
+# Initialize the database for both the development server and production WSGI.
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),
         debug=False,
     )
-
-# Initialize the database when running under a production WSGI server.
-init_db()
